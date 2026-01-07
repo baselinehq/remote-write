@@ -1,0 +1,196 @@
+package remotewrite
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"time"
+
+	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/prompb"
+)
+
+// PushRequest contains the data for a push operation.
+type PushRequest struct {
+	// TenantID is the tenant to push metrics for.
+	TenantID string
+
+	// Gatherer is the source of metrics.
+	Gatherer prometheus.Gatherer
+
+	// ExternalLabels are labels to add to every metric if not present.
+	ExternalLabels map[string]string
+
+	// Now returns the current time. If nil, time.Now() is used.
+	Now func() time.Time
+
+	// MaxBatchBytes is the target uncompressed batch size. Default: 3MB.
+	// This is soft limit; a single large metric family may exceed it.
+	MaxBatchBytes int
+
+	// MaxSeriesPerBatch is the maximum number of series per batch. Default: 10000.
+	MaxSeriesPerBatch int
+
+	// ExtraHeaders are additional headers to forward.
+	ExtraHeaders http.Header
+}
+
+// Push gathers metrics, batches them, and sends them to the remote write endpoint.
+func (c *Client) Push(ctx context.Context, pr PushRequest) error {
+	if pr.Gatherer == nil {
+		return fmt.Errorf("gatherer is required")
+	}
+
+	mfs, err := pr.Gatherer.Gather()
+	if err != nil {
+		return fmt.Errorf("gather failed: %w", err)
+	}
+	if len(mfs) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	if pr.Now != nil {
+		now = pr.Now()
+	}
+	nowMs := now.UnixMilli()
+
+	maxBytes := pr.MaxBatchBytes
+	if maxBytes <= 0 {
+		maxBytes = 3 * 1024 * 1024 // 3MB uncompressed default
+	}
+	maxSeries := pr.MaxSeriesPerBatch
+	if maxSeries <= 0 {
+		maxSeries = 10000
+	}
+
+	var extLabels []prompb.Label
+	if len(pr.ExternalLabels) > 0 {
+		extLabels = make([]prompb.Label, 0, len(pr.ExternalLabels))
+		for k, v := range pr.ExternalLabels {
+			extLabels = append(extLabels, prompb.Label{Name: k, Value: v})
+		}
+		sort.Slice(extLabels, func(i, j int) bool {
+			return extLabels[i].Name < extLabels[j].Name
+		})
+	}
+
+	// Batch and Send
+	tsBuf := getTimeSeriesSlice()
+	defer putTimeSeriesSlice(tsBuf)
+
+	// Track pooled label and sample slices for cleanup after each batch.
+	pooledLabels := make([]*[]prompb.Label, 0, 256)
+	pooledSamples := make([]*[]prompb.Sample, 0, 256)
+
+	// Ensure cleanup happens even on error paths
+	cleanup := func() {
+		for _, lbls := range pooledLabels {
+			putLabelSlice(lbls)
+		}
+		pooledLabels = pooledLabels[:0]
+		for _, smpls := range pooledSamples {
+			putSampleSlice(smpls)
+		}
+		pooledSamples = pooledSamples[:0]
+		*tsBuf = (*tsBuf)[:0]
+	}
+	defer cleanup()
+
+	flush := func() error {
+		if len(*tsBuf) == 0 {
+			return nil
+		}
+
+		// Prepare WriteRequest
+		req := prompb.WriteRequest{
+			Timeseries: *tsBuf,
+		}
+
+		// Marshal
+		pb := getProtoBuffer()
+		defer putProtoBuffer(pb)
+
+		if err := pb.Marshal(&req); err != nil {
+			return fmt.Errorf("marshal failed: %w", err)
+		}
+		raw := pb.Bytes()
+
+		// Compress with Snappy
+		maxEncoded := snappy.MaxEncodedLen(len(raw))
+		compressed := getSnappyBuffer()
+		defer putSnappyBuffer(compressed)
+
+		if cap(*compressed) < maxEncoded {
+			*compressed = make([]byte, maxEncoded)
+		}
+		encoded := snappy.Encode((*compressed)[:0], raw)
+
+		// Send
+		fwReq := ForwardRequest{
+			TenantID:           pr.TenantID,
+			BodyBytes:          encoded,
+			ContentType:        "application/x-protobuf",
+			ContentEncoding:    "snappy",
+			RemoteWriteVersion: "0.1.0",
+			ExtraHeaders:       pr.ExtraHeaders,
+		}
+
+		resp, err := c.Forward(ctx, fwReq)
+		if err != nil {
+			return fmt.Errorf("forward failed: %w", err)
+		}
+		if resp.StatusCode/100 != 2 {
+			// Read error response body (up to 4KB) for debugging
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			// Drain remainder for keep-alive
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("remote_write failed: status=%s body=%q", resp.Status, body)
+		}
+		// Drain and close response body
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		// Reset for next batch
+		cleanup()
+		return nil
+	}
+
+	// Process metric families and batch
+	estimatedBytes := 0
+	for _, mf := range mfs {
+		// Check for context cancellation between batches
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		startIdx := len(*tsBuf)
+
+		convertMetricFamily(mf, tsBuf, extLabels, nowMs, &pooledLabels, &pooledSamples)
+
+		// Estimate batch size for flush decisions
+		added := (*tsBuf)[startIdx:]
+		for i := range added {
+			ts := &added[i]
+			estimatedBytes += 16
+			for _, lbl := range ts.Labels {
+				estimatedBytes += len(lbl.Name) + len(lbl.Value) + 2
+			}
+		}
+
+		if len(*tsBuf) >= maxSeries || estimatedBytes >= maxBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+			estimatedBytes = 0
+		}
+	}
+
+	return flush()
+}
