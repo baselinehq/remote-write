@@ -10,6 +10,9 @@ import (
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -23,6 +26,10 @@ type PushRequest struct {
 
 	// ExternalLabels are labels to add to every metric if not present.
 	ExternalLabels map[string]string
+
+	// WriteRelabelConfigs are relabeling rules applied before sending.
+	// These can be used to filter, modify, or drop metrics.
+	WriteRelabelConfigs []relabel.Config
 
 	// Now returns the current time. If nil, time.Now() is used.
 	Now func() time.Time
@@ -42,6 +49,15 @@ type PushRequest struct {
 func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 	if pr.Gatherer == nil {
 		return fmt.Errorf("gatherer is required")
+	}
+
+	// Validate relabel configs
+	if len(pr.WriteRelabelConfigs) > 0 {
+		for _, p := range pr.WriteRelabelConfigs {
+			if err := p.Validate(model.UTF8Validation); err != nil {
+				return fmt.Errorf("invalid write_relabel_configs: %w", err)
+			}
+		}
 	}
 
 	mfs, err := pr.Gatherer.Gather()
@@ -173,6 +189,43 @@ func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 		startIdx := len(*tsBuf)
 
 		convertMetricFamily(mf, tsBuf, extLabels, nowMs, &pooledLabels, &pooledSamples)
+
+		// Apply write_relabel_configs to filter/modify series
+		if len(pr.WriteRelabelConfigs) > 0 {
+			writeIdx := startIdx
+			sb := labels.NewScratchBuilder(0)
+			cfgPtrs := make([]*relabel.Config, len(pr.WriteRelabelConfigs))
+			for i := range pr.WriteRelabelConfigs {
+				cfgPtrs[i] = &pr.WriteRelabelConfigs[i]
+			}
+
+			for i := startIdx; i < len(*tsBuf); i++ {
+				ts := &(*tsBuf)[i]
+
+				// Convert prompb.Label to labels.Labels using ScratchBuilder
+				sb.Reset()
+				for _, lbl := range ts.Labels {
+					sb.Add(lbl.Name, lbl.Value)
+				}
+				sb.Sort()
+				promLabels := sb.Labels()
+
+				// Apply relabel configs
+				relabeledLabels, keep := relabel.Process(promLabels, cfgPtrs...)
+				if !keep {
+					continue // drop this series
+				}
+
+				// Convert back to prompb.Label
+				ts.Labels = prompb.FromLabels(relabeledLabels, ts.Labels[:0])
+
+				if writeIdx != i {
+					(*tsBuf)[writeIdx] = *ts
+				}
+				writeIdx++
+			}
+			*tsBuf = (*tsBuf)[:writeIdx]
+		}
 
 		// Estimate batch size for flush decisions
 		added := (*tsBuf)[startIdx:]
