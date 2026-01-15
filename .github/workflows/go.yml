@@ -1,0 +1,34 @@
+name: Go
+
+on:
+  push:
+    branches: ["main"]
+    # Publish semver tags as releases.
+    tags: ["v*.*.*"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+    
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+    
+      - name: Configure Git
+        run: |
+          git config --global url."https://${{ github.actor }}:${{ secrets.GO_GET_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          echo "GOPRIVATE=github.com/baselinehq" >> $GITHUB_ENV
+    
+      - name: Run tests
+        run: go test -timeout 5m -v ./...
