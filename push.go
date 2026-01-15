@@ -53,8 +53,10 @@ func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 
 	// Validate relabel configs
 	if len(pr.WriteRelabelConfigs) > 0 {
-		for _, p := range pr.WriteRelabelConfigs {
-			if err := p.Validate(model.UTF8Validation); err != nil {
+		for i := range pr.WriteRelabelConfigs {
+			// Set the validation scheme for proper label name validation
+			pr.WriteRelabelConfigs[i].NameValidationScheme = model.UTF8Validation
+			if err := pr.WriteRelabelConfigs[i].Validate(model.UTF8Validation); err != nil {
 				return fmt.Errorf("invalid write_relabel_configs: %w", err)
 			}
 		}
