@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,13 +28,24 @@ func isRetryableError(err error) bool {
 	}
 
 	// Don't retry context cancellation or timeouts from user
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Timeout() {
+			return true
+		}
 		return false
 	}
 
 	// Check for TLS/certificate errors (permanent failures)
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return true
+		}
+
 		// Check if the underlying error is TLS-related
 		errStr := urlErr.Err.Error()
 		// x509 certificate errors are not retryable
@@ -44,6 +56,11 @@ func isRetryableError(err error) bool {
 		if strings.Contains(errStr, "tls:") || strings.Contains(errStr, "TLS handshake") {
 			return false
 		}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
 	}
 
 	// Network errors are generally retryable

@@ -1,11 +1,14 @@
 # remotewrite
 
-A high-performance Go client for Prometheus `remote_write` protocol.
+A Go client for Prometheus `remote_write` protocol with two transport layers:
+
+- `Client` for immediate synchronous delivery.
+- `DurableClient` for local disk spooling, restart survival, and background draining.
 
 ## What this library does
-1. Encode Prometheus metrics from a `prometheus.Gatherer` (like `prometheus.DefaultGatherer`) and push them via remote_write protocol to VictoriaMetrics or any compatible endpoint.
-
-2. Stream or replay incoming remote_write payloads to an upstream (proxy mode).
+1. Encode Prometheus metrics from a `prometheus.Gatherer` and push them via `remote_write`.
+2. Stream or replay incoming `remote_write` payloads to an upstream in proxy mode.
+3. Persist encoded `remote_write` payloads to a local durable queue and drain them later.
 
 ## Install
 
@@ -128,6 +131,141 @@ err = client.Push(ctx, remotewrite.PushRequest{
     },
 })
 ```
+
+## Durable Mode
+
+Use `DurableClient` when a long-running process must survive restarts or temporary upstream outages without dropping already-accepted payloads.
+
+`DurableClient` is transport-focused:
+
+- it accepts fully materialized `remote_write` payload bytes,
+- persists accepted payloads as local spool records on disk,
+- schedules those records through an internal VictoriaMetrics fast queue,
+- drains in the background,
+- retries retryable failures with backoff,
+- preserves FIFO semantics by default with `SendConcurrency: 1`.
+
+The durable layer does not require Prometheus internals or a second process.
+
+### Durable vs Synchronous
+
+- `Client` sends now and returns the result now.
+- `DurableClient` enqueues now and delivers later.
+- `Client.Push(...)` / `Client.PushTimeSeries(...)` encode and send immediately.
+- `DurableClient.Push(...)` / `DurableClient.PushTimeSeries(...)` encode and enqueue the resulting payloads.
+
+### Durable Daemon Example
+
+```go
+queueDir := "/var/lib/my-agent/remotewrite"
+
+dc, err := remotewrite.NewDurable(remotewrite.DurableConfig{
+    Client: remotewrite.Config{
+        UpstreamURL:  "https://mimir.example.com/api/v1/push",
+        TenantHeader: "X-Scope-OrgID",
+        Retry: &remotewrite.RetryConfig{
+            MinWait: time.Second,
+            MaxWait: 30 * time.Second,
+        },
+    },
+    QueueDir:        queueDir,
+    QueueName:       "metrics",
+    MaxInMemoryBlocks: 128,
+    MaxPendingBytes: 10 * 1024 * 1024 * 1024, // 10GiB budget
+    SendConcurrency: 1,
+    Registerer:      prometheus.DefaultRegisterer,
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer dc.Close()
+
+go func() {
+    if err := dc.Run(context.Background()); err != nil {
+        log.Fatalf("durable drain stopped: %v", err)
+    }
+}()
+
+ticker := time.NewTicker(15 * time.Second)
+defer ticker.Stop()
+
+for range ticker.C {
+    if err := dc.Push(context.Background(), remotewrite.PushRequest{
+        TenantID: "tenant-a",
+        Gatherer: prometheus.DefaultGatherer,
+        ExternalLabels: map[string]string{
+            "job":      "my-agent",
+            "instance": hostname,
+        },
+    }); err != nil {
+        log.Printf("enqueue failed: %v", err)
+    }
+}
+```
+
+### Durable API
+
+```go
+type DurableRequest struct {
+    TenantID           string
+    BodyBytes          []byte
+    ContentType        string
+    ContentEncoding    string
+    RemoteWriteVersion string
+    ExtraHeaders       http.Header
+}
+
+func NewDurable(cfg DurableConfig) (*DurableClient, error)
+func (dc *DurableClient) Run(ctx context.Context) error
+func (dc *DurableClient) Close() error
+func (dc *DurableClient) Enqueue(ctx context.Context, req DurableRequest) error
+func (dc *DurableClient) Push(ctx context.Context, req PushRequest) error
+func (dc *DurableClient) PushTimeSeries(ctx context.Context, req PushTimeSeriesRequest) error
+```
+
+`DurableClient.Enqueue(...)` requires replayable bytes. It does not accept a streaming `io.ReadCloser`.
+
+### Queue Sizing Notes
+
+- `MaxPendingBytes` bounds the total size of accepted spool records on disk. When the budget would be exceeded, `Enqueue(...)` returns `ErrDurableQueueBlocked`.
+- `MaxInMemoryBlocks` controls how many record references stay in memory before the internal scheduler spills them to files.
+- `DisablePersistence` disables normal file spillover for the internal scheduler queue. Accepted durable records are still written to disk, and their scheduler references may still be written during recovery or after acceptance.
+- Each queued record stores request metadata plus body bytes, so on-disk usage is slightly larger than `len(BodyBytes)`.
+- Use a single `DurableClient` per `QueueDir` + `QueueName` spool. `NewDurable(...)` takes an advisory spool lock and returns an error if another client already owns the same spool.
+- The scheduler queue is rebuilt from spool records on startup. The startup reset is safe only while the spool lock is held.
+
+### Ordering And Concurrency
+
+- The default `SendConcurrency` is `1`.
+- This preserves simple FIFO drain behavior and is the safest choice for Prometheus, Mimir, Cortex, Thanos, and similar backends that may reject out-of-order samples.
+- Values greater than `1` can improve throughput, but they may produce out-of-order delivery.
+
+### Retry And Reliability Notes
+
+- Retryable failures keep the durable record on disk and retry later.
+- Permanent failures drop the payload and increment `remotewrite_durable_permanent_failures_total` and `remotewrite_durable_dropped_total`.
+- Corrupt spool records are moved to the queue's `corrupt/` directory, counted, and skipped so they do not block valid records behind them.
+- The drain path is at-least-once. If the upstream accepts a payload and the process crashes before the durable record is removed, that payload can be replayed after restart.
+- Accepted payload durability comes from the spool record itself, not from the destructive scheduler queue read path.
+- Once `Enqueue(...)` durably writes a spool record, the payload is considered accepted and will be scheduled even if the caller's context is cancelled immediately afterward.
+- `Enqueue(...)` performs a durable record write and directory sync before the payload is considered accepted, so it is more expensive than the synchronous `Client` fast path.
+- `Run(...)` is intended for a single long-lived drain loop per `DurableClient`.
+
+### Durable Metrics
+
+The durable layer exports:
+
+- `remotewrite_durable_enqueued_total`
+- `remotewrite_durable_sent_total`
+- `remotewrite_durable_send_failures_total`
+- `remotewrite_durable_retryable_failures_total`
+- `remotewrite_durable_permanent_failures_total`
+- `remotewrite_durable_dropped_total`
+- `remotewrite_durable_corrupt_records_total`
+- `remotewrite_durable_queue_pending_bytes`
+- `remotewrite_durable_queue_inmemory_blocks`
+- `remotewrite_durable_queue_blocked`
+- `remotewrite_durable_inflight`
 ### External Labels Merge Rule
 
 External labels are merged with metric labels using this rule:
