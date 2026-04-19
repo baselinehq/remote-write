@@ -1,7 +1,9 @@
 package remotewrite
 
 import (
+	"context"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -171,5 +173,23 @@ func TestIsRetryableStatusCode(t *testing.T) {
 				t.Errorf("isRetryableStatusCode(%d) = %v, want %v", tt.code, result, tt.retryable)
 			}
 		})
+	}
+}
+
+func TestIsRetryableError_HTTPClientTimeoutWrappedAsURLError(t *testing.T) {
+	err := &url.Error{
+		Op:  "Post",
+		URL: "http://example.invalid",
+		Err: context.DeadlineExceeded,
+	}
+
+	if !isRetryableError(err) {
+		t.Fatal("expected wrapped timeout to be retryable")
+	}
+}
+
+func TestIsRetryableError_UserDeadlineExceededIsNotRetryable(t *testing.T) {
+	if isRetryableError(context.DeadlineExceeded) {
+		t.Fatal("expected user deadline exceeded to be non-retryable")
 	}
 }

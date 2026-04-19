@@ -3,12 +3,10 @@ package remotewrite
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"time"
 
-	"github.com/klauspost/compress/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -45,8 +43,7 @@ type PushRequest struct {
 	ExtraHeaders http.Header
 }
 
-// Push gathers metrics, batches them, and sends them to the remote write endpoint.
-func (c *Client) Push(ctx context.Context, pr PushRequest) error {
+func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Context, DurableRequest) error) error {
 	if pr.Gatherer == nil {
 		return fmt.Errorf("gatherer is required")
 	}
@@ -122,56 +119,19 @@ func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 		if len(*tsBuf) == 0 {
 			return nil
 		}
-
-		// Prepare WriteRequest
-		req := prompb.WriteRequest{
-			Timeseries: *tsBuf,
-		}
-
-		// Marshal
-		pb := getProtoBuffer()
-		defer putProtoBuffer(pb)
-
-		if err := pb.Marshal(&req); err != nil {
-			return fmt.Errorf("marshal failed: %w", err)
-		}
-		raw := pb.Bytes()
-
-		// Compress with Snappy
-		maxEncoded := snappy.MaxEncodedLen(len(raw))
-		compressed := getSnappyBuffer()
-		defer putSnappyBuffer(compressed)
-
-		if cap(*compressed) < maxEncoded {
-			*compressed = make([]byte, maxEncoded)
-		}
-		encoded := snappy.Encode((*compressed)[:0], raw)
-
-		// Send
-		fwReq := ForwardRequest{
-			TenantID:           pr.TenantID,
-			BodyBytes:          encoded,
-			ContentType:        "application/x-protobuf",
-			ContentEncoding:    "snappy",
-			RemoteWriteVersion: "0.1.0",
-			ExtraHeaders:       pr.ExtraHeaders,
-		}
-
-		resp, err := c.Forward(ctx, fwReq)
+		err := withEncodedTimeSeries(*tsBuf, func(encoded []byte) error {
+			return deliver(ctx, DurableRequest{
+				TenantID:           pr.TenantID,
+				BodyBytes:          encoded,
+				ContentType:        defaultRemoteWriteContentType,
+				ContentEncoding:    defaultRemoteWriteContentEncoding,
+				RemoteWriteVersion: defaultRemoteWriteVersion,
+				ExtraHeaders:       pr.ExtraHeaders,
+			})
+		})
 		if err != nil {
-			return fmt.Errorf("forward failed: %w", err)
+			return err
 		}
-		if resp.StatusCode/100 != 2 {
-			// Read error response body (up to 4KB) for debugging
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-			// Drain remainder for keep-alive
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("remote_write failed: status=%s body=%q", resp.Status, body)
-		}
-		// Drain and close response body
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 
 		// Reset for next batch
 		cleanup()
@@ -248,4 +208,9 @@ func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 	}
 
 	return flush()
+}
+
+// Push gathers metrics, batches them, and sends them to the remote write endpoint.
+func (c *Client) Push(ctx context.Context, pr PushRequest) error {
+	return pushGathered(ctx, pr, c.sendEncoded)
 }
