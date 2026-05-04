@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/klauspost/compress/snappy"
+	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/prompb"
