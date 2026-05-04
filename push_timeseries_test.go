@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/klauspost/compress/snappy"
+	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/prompb"
 )
 
