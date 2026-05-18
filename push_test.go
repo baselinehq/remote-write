@@ -205,6 +205,40 @@ func TestEncoder_Histogram(t *testing.T) {
 	assert.Equal(t, float64(1), (*tsBuf)[4].Samples[0].Value)
 }
 
+// TestPush_DoesNotMutateRelabelConfigs verifies that Push does not write back
+// derived fields (e.g. NameValidationScheme) into the caller's slice.
+func TestPush_DoesNotMutateRelabelConfigs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := New(Config{UpstreamURL: server.URL})
+	require.NoError(t, err)
+	defer client.Close()
+
+	reg := prometheus.NewRegistry()
+	c := prometheus.NewCounter(prometheus.CounterOpts{Name: "x"})
+	c.Inc()
+	reg.MustRegister(c)
+
+	cfgs := []relabel.Config{{
+		SourceLabels: []model.LabelName{"__name__"},
+		Regex:        relabel.MustNewRegexp("x"),
+		Action:       relabel.Keep,
+	}}
+	originalScheme := cfgs[0].NameValidationScheme
+	originalRegexSrc := cfgs[0].Regex.String()
+
+	require.NoError(t, client.Push(context.Background(), PushRequest{
+		Gatherer:            reg,
+		WriteRelabelConfigs: cfgs,
+	}))
+
+	assert.Equal(t, originalScheme, cfgs[0].NameValidationScheme, "caller's NameValidationScheme was mutated")
+	assert.Equal(t, originalRegexSrc, cfgs[0].Regex.String(), "caller's Regex was mutated")
+}
+
 // TestPush_WriteRelabelConfigs_Drop verifies that series are dropped when relabel action is drop.
 func TestPush_WriteRelabelConfigs_Drop(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

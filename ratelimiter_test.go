@@ -1,6 +1,8 @@
 package remotewrite
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -8,7 +10,9 @@ import (
 
 func TestRateLimiter_Disabled(t *testing.T) {
 	var rl *RateLimiter
-	rl.Register(1000) // Should not panic
+	if err := rl.Register(context.Background(), 1000); err != nil {
+		t.Fatalf("disabled nil limiter returned error: %v", err)
+	}
 
 	// Zero limit should be disabled
 	stopCh := make(chan struct{})
@@ -16,7 +20,9 @@ func TestRateLimiter_Disabled(t *testing.T) {
 	if rl.Enabled() {
 		t.Error("limiter with 0 limit should be disabled")
 	}
-	rl.Register(1000) // Should not block
+	if err := rl.Register(context.Background(), 1000); err != nil {
+		t.Fatalf("disabled zero-limit limiter returned error: %v", err)
+	}
 	close(stopCh)
 }
 
@@ -32,16 +38,51 @@ func TestRateLimiter_Basic(t *testing.T) {
 
 	// First 1000 bytes should not block
 	start := time.Now()
-	rl.Register(1000)
+	if err := rl.Register(context.Background(), 1000); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
 	if time.Since(start) > 50*time.Millisecond {
 		t.Error("first batch should not block")
 	}
 
 	// Next batch should block until refill
-	rl.Register(100)
+	if err := rl.Register(context.Background(), 100); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
 	elapsed := time.Since(start)
 	if elapsed < 900*time.Millisecond {
 		t.Errorf("second batch should have blocked for ~1s, only blocked for %v", elapsed)
+	}
+}
+
+func TestRateLimiter_LargeRegistrationChunks(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	rl := NewRateLimiter(32*1024, stopCh)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rl.Register(ctx, 64*1024); err != nil {
+		t.Fatalf("large registration should be chunked, got error: %v", err)
+	}
+}
+
+func TestRateLimiter_ContextCancellation(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	rl := NewRateLimiter(10, stopCh)
+	if err := rl.Register(context.Background(), 10); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := rl.Register(ctx, 10)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
 	}
 }
 
@@ -52,13 +93,14 @@ func TestRateLimiter_StopChannel(t *testing.T) {
 	rl := NewRateLimiter(10, stopCh)
 
 	// Consume the budget
-	rl.Register(10)
+	if err := rl.Register(context.Background(), 10); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
 
 	// Start a goroutine that will be blocked
-	done := make(chan struct{})
+	done := make(chan error)
 	go func() {
-		rl.Register(100) // This should block
-		close(done)
+		done <- rl.Register(context.Background(), 100) // This should block
 	}()
 
 	// Wait a bit, then close stopCh to unblock
@@ -67,8 +109,10 @@ func TestRateLimiter_StopChannel(t *testing.T) {
 
 	// Should unblock quickly
 	select {
-	case <-done:
-		// Success
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Register returned error after stopCh closed: %v", err)
+		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Register did not unblock after stopCh closed")
 	}
@@ -87,7 +131,10 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				rl.Register(100)
+				if err := rl.Register(context.Background(), 100); err != nil {
+					t.Errorf("Register failed: %v", err)
+					return
+				}
 			}
 		}()
 	}

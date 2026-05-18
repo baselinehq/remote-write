@@ -1,6 +1,6 @@
 module github.com/baselinehq/remote-write
 
-go 1.25.5
+go 1.25.4
 
 require (
 	github.com/VictoriaMetrics/VictoriaMetrics v1.130.0

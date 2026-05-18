@@ -18,8 +18,9 @@ type Config struct {
 	// May contain {tenant} placeholder for tenant-based URL routing.
 	UpstreamURL string
 
-	// Timeout is the HTTP request timeout. Default: 30s.
-	// For minimal overhead, consider using 0 and relying on context deadlines.
+	// Timeout, if > 0, is applied to http.Client.Timeout and (for the default
+	// transport) ResponseHeaderTimeout. Default: 0 (no client-level timeout).
+	// Prefer context deadlines on each call.
 	Timeout time.Duration
 
 	// TenantHeader is the header name for tenant injection.
@@ -91,7 +92,9 @@ type ForwardRequest struct {
 	// GetBody returns a fresh body for retries.
 	GetBody func() (io.ReadCloser, error)
 
-	// ContentLength is the body size. -1 if unknown.
+	// ContentLength is the body size. Set to -1 (or leave 0 with a non-nil
+	// Body) when the size is unknown — Forward treats 0 with a streaming Body
+	// as "unknown" so net/http does not advertise an empty body.
 	ContentLength int64
 
 	// ContentType header value.
@@ -103,7 +106,8 @@ type ForwardRequest struct {
 	// RemoteWriteVersion header value.
 	RemoteWriteVersion string
 
-	// ExtraHeaders are additional headers to forward.
+	// ExtraHeaders are additional headers to forward. It must not contain
+	// protocol headers or headers managed by client configuration.
 	ExtraHeaders http.Header
 }
 
@@ -113,6 +117,8 @@ type Client struct {
 	tenantURLPrefix  *url.URL // parsed URL with path split at {tenant}
 	tenantPathPrefix string   // path before {tenant}
 	tenantPathSuffix string   // path after {tenant}
+	tenantRawPrefix  string   // escaped path before {tenant}
+	tenantRawSuffix  string   // escaped path after {tenant}
 	hasTenantVar     bool
 
 	httpClient *http.Client
@@ -232,23 +238,36 @@ func New(cfg Config) (*Client, error) {
 		client.retryConfig = &rc
 	}
 
+	parsedURL, err := parseUpstreamURL(cfg.UpstreamURL)
+	if err != nil {
+		return nil, err
+	}
+
 	if strings.Contains(cfg.UpstreamURL, "{tenant}") {
+		if strings.Count(parsedURL.Path, "{tenant}") != 1 ||
+			strings.Contains(parsedURL.Host, "{tenant}") ||
+			strings.Contains(parsedURL.RawQuery, "{tenant}") ||
+			strings.Contains(parsedURL.Fragment, "{tenant}") ||
+			(parsedURL.User != nil && strings.Contains(parsedURL.User.String(), "{tenant}")) {
+			return nil, fmt.Errorf("{tenant} placeholder is only supported once in URL path")
+		}
+
 		client.hasTenantVar = true
-		idx := strings.Index(cfg.UpstreamURL, "{tenant}")
-		placeholderURL := cfg.UpstreamURL[:idx] + "__TENANT__" + cfg.UpstreamURL[idx+len("{tenant}"):]
-		parsedURL, err := url.Parse(placeholderURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid UpstreamURL: %w", err)
-		}
 		client.tenantURLPrefix = parsedURL
-		pathIdx := strings.Index(parsedURL.Path, "__TENANT__")
+
+		pathIdx := strings.Index(parsedURL.Path, "{tenant}")
 		client.tenantPathPrefix = parsedURL.Path[:pathIdx]
-		client.tenantPathSuffix = parsedURL.Path[pathIdx+len("__TENANT__"):]
-	} else {
-		parsedURL, err := url.Parse(cfg.UpstreamURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid UpstreamURL: %w", err)
+		client.tenantPathSuffix = parsedURL.Path[pathIdx+len("{tenant}"):]
+
+		escapedPath := parsedURL.EscapedPath()
+		escapedPlaceholder := url.PathEscape("{tenant}")
+		rawPathIdx := strings.Index(escapedPath, escapedPlaceholder)
+		if rawPathIdx < 0 {
+			return nil, fmt.Errorf("invalid UpstreamURL: failed to locate escaped {tenant} placeholder")
 		}
+		client.tenantRawPrefix = escapedPath[:rawPathIdx]
+		client.tenantRawSuffix = escapedPath[rawPathIdx+len(escapedPlaceholder):]
+	} else {
 		client.baseURL = parsedURL
 	}
 
@@ -259,10 +278,24 @@ func New(cfg Config) (*Client, error) {
 	return client, nil
 }
 
+func parseUpstreamURL(rawURL string) (*url.URL, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UpstreamURL: %w", err)
+	}
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return nil, fmt.Errorf("invalid UpstreamURL: absolute URL with scheme and host required")
+	}
+	return parsedURL, nil
+}
+
 // Forward sends a remote write request to the upstream
 func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Response, error) {
 	if c.closed.Load() {
 		return nil, errors.New("client is closed")
+	}
+	if err := c.validateExtraHeaders(req.ExtraHeaders); err != nil {
+		return nil, err
 	}
 
 	// Build target URL
@@ -272,6 +305,7 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 		// Use pre-parsed URL with tenant path substitution
 		u := *c.tenantURLPrefix // copy struct
 		u.Path = c.tenantPathPrefix + req.TenantID + c.tenantPathSuffix
+		u.RawPath = c.tenantRawPrefix + url.PathEscape(req.TenantID) + c.tenantRawSuffix
 		parsedURL = &u
 	} else {
 		parsedURL = c.baseURL
@@ -306,25 +340,30 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 			}
 		}
 	} else if req.Body != nil {
+		// ContentLength == 0 with a non-nil Body almost always means the caller
+		// did not set it. Treat as unknown so net/http does not advertise a
+		// zero-length body for a Reader that may produce bytes. Callers that
+		// genuinely have a zero-byte body should pass BodyBytes (or omit Body).
+		if contentLength == 0 {
+			contentLength = -1
+		}
 		if retriesEnabled {
-			// Check known size limit
-			if c.retryConfig.MaxBodySize > 0 && req.ContentLength > c.retryConfig.MaxBodySize {
-				retriesEnabled = false
-				body = req.Body
-			} else {
-				bodyMode = 3
-				maxSize := c.retryConfig.MaxBodySize
-				data, pc, err := readAllPooled(req.Body, req.ContentLength, maxSize)
+			maxSize := c.retryConfig.MaxBodySize
+			if maxSize > 0 && contentLength > maxSize {
 				req.Body.Close()
-				if err != nil {
-					return nil, fmt.Errorf("failed to buffer body: %w", err)
-				}
-				poolBuf = data
-				poolClass = pc
-				bodyData = data
-				body = getByteBody(data)
-				contentLength = int64(len(data))
+				return nil, fmt.Errorf("failed to buffer body: %w", errBodyTooLarge)
 			}
+			bodyMode = 3
+			data, pc, err := readAllPooled(req.Body, contentLength, maxSize)
+			req.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to buffer body: %w", err)
+			}
+			poolBuf = data
+			poolClass = pc
+			bodyData = data
+			body = getByteBody(data)
+			contentLength = int64(len(data))
 		} else {
 			// Streaming mode, no buffering
 			body = req.Body
@@ -333,13 +372,18 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 		body = http.NoBody
 	}
 
-	// Build getBody lazily based on mode
-	if retriesEnabled && getBody == nil && bodyMode > 0 {
+	// Build getBody lazily based on mode. Retry mode always needs a replay
+	// function, even for requests with no body.
+	if retriesEnabled && getBody == nil {
 		// Only used during retries - create closure on demand
 		switch bodyMode {
 		case 1, 3: // BodyBytes or buffered
 			getBody = func() (io.ReadCloser, error) {
 				return getByteBody(bodyData), nil
+			}
+		default:
+			getBody = func() (io.ReadCloser, error) {
+				return http.NoBody, nil
 			}
 		}
 	}
@@ -350,7 +394,10 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 	}
 
 	if c.rateLimiter != nil && contentLength > 0 {
-		c.rateLimiter.Register(int(contentLength))
+		if err := c.rateLimiter.Register(ctx, contentLength); err != nil {
+			body.Close()
+			return nil, err
+		}
 	}
 
 	httpReq, err := c.newRequest(ctx, parsedURL, body, contentLength, req)
@@ -394,7 +441,9 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 		}
 	}
 
-	// Retry loop
+	// Retry loop. The first retry waits MinWait (plus jitter); subsequent
+	// retries double up to MaxWait. Retry-After overrides this schedule for
+	// the current attempt.
 	retryDuration := c.retryConfig.MinWait
 	maxDuration := c.retryConfig.MaxWait
 
@@ -408,9 +457,10 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 		if resp != nil {
 			retryAfter = parseRetryAfterHeader(resp.Header.Get("Retry-After"))
 		}
-		retryDuration = getRetryDuration(retryAfter, retryDuration, maxDuration)
+		wait := nextRetryWait(retryAfter, retryDuration)
+		retryDuration = advanceRetryWait(retryDuration, maxDuration)
 
-		if err := waitForRetry(ctx, retryDuration); err != nil {
+		if err := waitForRetry(ctx, wait); err != nil {
 			return nil, fmt.Errorf("retry cancelled: %w", err)
 		}
 
@@ -450,6 +500,34 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) (*http.Respons
 		return nil, fmt.Errorf("max retries exceeded: %w", err)
 	}
 	return resp, nil
+}
+
+func (c *Client) validateExtraHeaders(headers http.Header) error {
+	for key := range headers {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if isReservedExtraHeader(canonicalKey) {
+			return fmt.Errorf("ExtraHeaders contains reserved header %q", key)
+		}
+		if len(c.authV) > 0 && canonicalKey == "Authorization" {
+			return fmt.Errorf("ExtraHeaders contains protected header %q", key)
+		}
+		if c.tenantHeader != "" && canonicalKey == http.CanonicalHeaderKey(c.tenantHeader) {
+			return fmt.Errorf("ExtraHeaders contains protected header %q", key)
+		}
+	}
+	return nil
+}
+
+func isReservedExtraHeader(canonicalKey string) bool {
+	switch canonicalKey {
+	case "Content-Encoding",
+		"Content-Type",
+		"User-Agent",
+		"X-Prometheus-Remote-Write-Version":
+		return true
+	default:
+		return false
+	}
 }
 
 // newRequest creates an HTTP request.

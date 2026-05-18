@@ -30,7 +30,8 @@ type DurableRequest struct {
 	ContentEncoding string
 	// RemoteWriteVersion is the X-Prometheus-Remote-Write-Version header value.
 	RemoteWriteVersion string
-	// ExtraHeaders are additional HTTP headers to forward upstream.
+	// ExtraHeaders are additional HTTP headers to forward upstream. It must not
+	// contain protocol headers or headers managed by client configuration.
 	ExtraHeaders http.Header
 }
 

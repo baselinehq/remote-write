@@ -2,6 +2,7 @@ package remotewrite
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 )
@@ -144,48 +145,15 @@ func (e *bodyTooLargeError) Error() string {
 	return "body exceeds maximum size for retry buffering"
 }
 
-// IsBodyTooLarge returns true if the error indicates the body exceeded MaxBodySize
+// IsBodyTooLarge returns true if err (or any error in its chain) indicates
+// the body exceeded RetryConfig.MaxBodySize.
 func IsBodyTooLarge(err error) bool {
-	_, ok := err.(*bodyTooLargeError)
-	return ok
+	var target *bodyTooLargeError
+	return errors.As(err, &target)
 }
 
-// byteBody is a pooled ReadCloser that wraps bytes.Reader
-// This avoids allocating *bytes.Reader on every request
-type byteBody struct {
-	r bytes.Reader
-}
-
-func (b *byteBody) Read(p []byte) (n int, err error) {
-	return b.r.Read(p)
-}
-
-// WriteTo implements io.WriterTo to preserve bytes.Reader fast-path optimization
-func (b *byteBody) WriteTo(w io.Writer) (int64, error) {
-	return b.r.WriteTo(w)
-}
-
-func (b *byteBody) Close() error {
-	// Reset reader to drop references ASAP
-	b.r.Reset(nil)
-	// Return to pool - transport will call Close() when done
-	byteBodyPool.Put(b)
-	return nil
-}
-
-func (b *byteBody) reset(data []byte) {
-	b.r.Reset(data)
-}
-
-var byteBodyPool = sync.Pool{
-	New: func() any {
-		return &byteBody{}
-	},
-}
-
-// getByteBody returns a pooled byteBody initialized with data
+// getByteBody returns a body initialized with data. Using io.NopCloser around
+// *bytes.Reader lets net/http unwrap the body and use its in-memory fast path.
 func getByteBody(data []byte) io.ReadCloser {
-	b := byteBodyPool.Get().(*byteBody)
-	b.reset(data)
-	return b
+	return io.NopCloser(bytes.NewReader(data))
 }

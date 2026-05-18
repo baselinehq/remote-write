@@ -3,32 +3,50 @@ name: Go
 on:
   push:
     branches: ["main"]
-    # Publish semver tags as releases.
     tags: ["v*.*.*"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-
-
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-    
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-    
-      - name: Configure Git
-        run: |
-          git config --global url."https://${{ github.actor }}:${{ secrets.GO_GET_TOKEN }}@github.com/".insteadOf "https://github.com/"
-          echo "GOPRIVATE=github.com/baselinehq" >> $GITHUB_ENV
-    
+
       - name: Run tests
-        run: go test -timeout 5m -v ./...
+        run: go test -timeout 5m ./...
+
+      - name: Run race tests
+        run: go test -race -run Test -timeout 10m ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test/integration/go.mod
+          cache: true
+          cache-dependency-path: test/integration/go.sum
+
+      - name: Run integration tests
+        working-directory: test/integration
+        run: go test -timeout 10m ./...
