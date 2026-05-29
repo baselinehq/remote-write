@@ -59,12 +59,13 @@ func TestVictoriaMetricsIntegration(t *testing.T) {
 
 	metric := fmt.Sprintf("rw_integration_%d", time.Now().UnixNano())
 	want := 42.0
+	sampleTS := time.Now().Add(-10 * time.Second).UnixMilli()
 	series := []prompb.TimeSeries{{
 		Labels: []prompb.Label{
 			{Name: "__name__", Value: metric},
 			{Name: "job", Value: "remotewrite-integration"},
 		},
-		Samples: []prompb.Sample{{Value: want, Timestamp: time.Now().UnixMilli()}},
+		Samples: []prompb.Sample{{Value: want, Timestamp: sampleTS}},
 	}}
 
 	if err := client.PushTimeSeries(ctx, remotewrite.PushTimeSeriesRequest{TimeSeries: series}); err != nil {
