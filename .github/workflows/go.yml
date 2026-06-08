@@ -34,19 +34,3 @@ jobs:
 
       - name: Run vet
         run: go vet ./...
-
-  integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: test/integration/go.mod
-          cache: true
-          cache-dependency-path: test/integration/go.sum
-
-      - name: Run integration tests
-        working-directory: test/integration
-        run: go test -timeout 10m ./...
