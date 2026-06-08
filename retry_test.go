@@ -101,12 +101,11 @@ func TestAddJitter_MaxCap(t *testing.T) {
 	}
 }
 
-func TestGetRetryDuration(t *testing.T) {
+func TestNextRetryWait(t *testing.T) {
 	tests := []struct {
 		name        string
 		retryAfter  time.Duration
 		current     time.Duration
-		max         time.Duration
 		expectedMin time.Duration
 		expectedMax time.Duration
 	}{
@@ -114,36 +113,35 @@ func TestGetRetryDuration(t *testing.T) {
 			name:        "retry_after_takes_precedence",
 			retryAfter:  5 * time.Second,
 			current:     1 * time.Second,
-			max:         30 * time.Second,
 			expectedMin: 5 * time.Second,
-			expectedMax: 5*time.Second + 1*time.Second, // with jitter
+			expectedMax: 5*time.Second + 1*time.Second,
 		},
 		{
-			name:        "exponential_backoff",
+			name:        "first_retry_uses_current",
 			retryAfter:  0,
 			current:     1 * time.Second,
-			max:         30 * time.Second,
-			expectedMin: 2 * time.Second,
-			expectedMax: 2*time.Second + 1*time.Second, // with jitter
-		},
-		{
-			name:        "capped_at_max",
-			retryAfter:  0,
-			current:     20 * time.Second,
-			max:         30 * time.Second,
-			expectedMin: 30 * time.Second,
-			expectedMax: 30*time.Second + 10*time.Second, // with jitter (capped at 10s)
+			expectedMin: 1 * time.Second,
+			expectedMax: 1*time.Second + 1*time.Second/10,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getRetryDuration(tt.retryAfter, tt.current, tt.max)
+			result := nextRetryWait(tt.retryAfter, tt.current)
 			if result < tt.expectedMin || result > tt.expectedMax {
-				t.Errorf("getRetryDuration(%v, %v, %v) = %v, expected [%v, %v]",
-					tt.retryAfter, tt.current, tt.max, result, tt.expectedMin, tt.expectedMax)
+				t.Errorf("nextRetryWait(%v, %v) = %v, expected [%v, %v]",
+					tt.retryAfter, tt.current, result, tt.expectedMin, tt.expectedMax)
 			}
 		})
+	}
+}
+
+func TestAdvanceRetryWait(t *testing.T) {
+	if got := advanceRetryWait(time.Second, 30*time.Second); got != 2*time.Second {
+		t.Errorf("advanceRetryWait(1s, 30s) = %v, want 2s", got)
+	}
+	if got := advanceRetryWait(20*time.Second, 30*time.Second); got != 30*time.Second {
+		t.Errorf("advanceRetryWait(20s, 30s) = %v, want 30s (capped)", got)
 	}
 }
 
@@ -164,6 +162,9 @@ func TestIsRetryableStatusCode(t *testing.T) {
 		{502, true},
 		{503, true},
 		{504, true},
+		{599, true},
+		{600, false}, // Outside HTTP range
+		{700, false},
 	}
 
 	for _, tt := range tests {

@@ -1,3 +1,7 @@
+// Durable spool mode uses flock(2) and is unix-only.
+
+//go:build unix
+
 package remotewrite
 
 import (
@@ -63,11 +67,24 @@ type DurableConfig struct {
 	Registerer prometheus.Registerer
 }
 
-// DurableClient persists encoded remote_write payloads locally and drains them in the background.
+// DurableClient persists encoded remote_write payloads locally and drains
+// them in the background.
 //
-// Accepted payloads are stored as record files under QueueDir, and the VictoriaMetrics fast
-// queue is used only to schedule record IDs for background delivery. This keeps accepted data
-// durable even though MustReadBlock is destructive.
+// Accepted payloads are stored as record files under QueueDir, and the
+// scheduler queue is used only to schedule record IDs for background
+// delivery. This keeps accepted data durable even though the scheduler's read
+// path is destructive.
+//
+// Retry policy. The drain loop retries retryable failures indefinitely with
+// exponential backoff (RetryConfig.MinWait → MaxWait, plus jitter). It
+// honours Retry-After when present. RetryConfig.MaxRetries from the wrapped
+// Client config is intentionally ignored — durable payloads have already
+// been accepted on disk, so dropping them after N attempts would be
+// surprising. Use Close (or cancel Run's context) to stop draining.
+//
+// Platform support. Durable mode acquires an exclusive flock on the spool
+// directory and is therefore Unix-only (Linux, macOS, *BSD). It is not
+// supported on Windows.
 type DurableClient struct {
 	client *Client
 	queue  *persistentqueue.FastQueue
@@ -155,11 +172,16 @@ func NewDurable(cfg DurableConfig) (*DurableClient, error) {
 		return nil, err
 	}
 
-	queue := persistentqueue.MustOpenFastQueue(scheduleDir, cfg.QueueName, cfg.MaxInMemoryBlocks, 0, cfg.DisablePersistence)
+	queue, err := openFastQueue(scheduleDir, cfg.QueueName, cfg.MaxInMemoryBlocks, cfg.DisablePersistence)
+	if err != nil {
+		_ = client.Close()
+		_ = releaseSpoolLock(lockF)
+		return nil, err
+	}
 
 	records, maxRecordID, totalPendingBytes, err := scanDurableRecords(recordsDir)
 	if err != nil {
-		queue.MustClose()
+		_ = closeQueue(queue)
 		_ = client.Close()
 		_ = releaseSpoolLock(lockF)
 		return nil, err
@@ -183,11 +205,16 @@ func NewDurable(cfg DurableConfig) (*DurableClient, error) {
 	dc.nextRecordID.Store(maxRecordID)
 	dc.pendingBytes.Store(totalPendingBytes)
 
-	dc.seedQueue(records)
+	if err := dc.seedQueue(records); err != nil {
+		_ = closeQueue(queue)
+		_ = client.Close()
+		_ = releaseSpoolLock(lockF)
+		return nil, err
+	}
 
 	metrics, err := newDurableMetrics(dc, cfg.Registerer)
 	if err != nil {
-		queue.MustClose()
+		_ = closeQueue(queue)
 		_ = client.Close()
 		_ = releaseSpoolLock(lockF)
 		return nil, err
@@ -241,7 +268,9 @@ func (dc *DurableClient) Enqueue(ctx context.Context, req DurableRequest) error 
 	// From this point the payload is accepted. The scheduler queue contains only
 	// recoverable record references, so write the reference even when scheduler
 	// persistence is disabled instead of returning an ambiguous enqueue error.
-	dc.queue.MustWriteBlockIgnoreDisabledPQ(encodeDurableRecordRef(record.id))
+	if err := writeQueueBlock(dc.queue, encodeDurableRecordRef(record.id)); err != nil {
+		return err
+	}
 	dc.metrics.enqueuedTotal.Inc()
 	return nil
 }
@@ -311,10 +340,58 @@ func (dc *DurableClient) Close() error {
 	dc.lifecycleMu.Unlock()
 
 	dc.runWG.Wait()
-	dc.queue.MustClose()
+	queueErr := closeQueue(dc.queue)
 	dc.metrics.unregister()
 
-	return errors.Join(dc.client.Close(), releaseSpoolLock(dc.lockF))
+	return errors.Join(queueErr, dc.client.Close(), releaseSpoolLock(dc.lockF))
+}
+
+// openFastQueue, writeQueueBlock, readQueueBlock, and closeQueue wrap the
+// VictoriaMetrics persistentqueue Must* APIs so that environmental failures
+// (disk full, IO errors, corrupted scheduler state) surface as errors instead
+// of crashing the calling process.
+
+func openFastQueue(scheduleDir, queueName string, maxInmemoryBlocks int, disablePersistence bool) (q *persistentqueue.FastQueue, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("open durable scheduler queue %q: %v", scheduleDir, r)
+		}
+	}()
+	q = persistentqueue.MustOpenFastQueue(scheduleDir, queueName, maxInmemoryBlocks, 0, disablePersistence)
+	return q, nil
+}
+
+func writeQueueBlock(q *persistentqueue.FastQueue, ref []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("write durable scheduler queue: %v", r)
+		}
+	}()
+	q.MustWriteBlockIgnoreDisabledPQ(ref)
+	return nil
+}
+
+func readQueueBlock(q *persistentqueue.FastQueue, dst []byte) (out []byte, ok bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("read durable scheduler queue: %v", r)
+		}
+	}()
+	out, ok = q.MustReadBlock(dst)
+	return out, ok, nil
+}
+
+func closeQueue(q *persistentqueue.FastQueue) (err error) {
+	if q == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("close durable scheduler queue: %v", r)
+		}
+	}()
+	q.MustClose()
+	return nil
 }
 
 func (dc *DurableClient) runLoop(ctx context.Context, cancel context.CancelFunc) error {
@@ -381,8 +458,14 @@ func (dc *DurableClient) dispatch(ctx context.Context, workCh chan<- durableReco
 			return err
 		}
 
-		var ok bool
-		refBuf, ok = dc.queue.MustReadBlock(refBuf[:0])
+		var (
+			ok      bool
+			readErr error
+		)
+		refBuf, ok, readErr = readQueueBlock(dc.queue, refBuf[:0])
+		if readErr != nil {
+			return readErr
+		}
 		if !ok {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -644,12 +727,15 @@ func (dc *DurableClient) quarantineRecord(record durableRecord, cause error) err
 	return nil
 }
 
-func (dc *DurableClient) seedQueue(records []durableRecord) {
+func (dc *DurableClient) seedQueue(records []durableRecord) error {
 	for _, record := range records {
 		// Recovery must remain possible even when DisablePersistence is true, so recovered
 		// record references are re-seeded with IgnoreDisabledPQ.
-		dc.queue.MustWriteBlockIgnoreDisabledPQ(encodeDurableRecordRef(record.id))
+		if err := writeQueueBlock(dc.queue, encodeDurableRecordRef(record.id)); err != nil {
+			return fmt.Errorf("seed scheduler queue with record %d: %w", record.id, err)
+		}
 	}
+	return nil
 }
 
 func (dc *DurableClient) recordPath(recordID uint64) string {

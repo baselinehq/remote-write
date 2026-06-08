@@ -1,6 +1,8 @@
 package remotewrite
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -8,7 +10,7 @@ import (
 // RateLimiter implements a token bucket rate limiter for bytes per second.
 //
 // The limiter refills perSecondLimit tokens every second.
-// Register() blocks when the bucket is empty.
+// Register blocks when the bucket is empty.
 type RateLimiter struct {
 	perSecondLimit int64
 
@@ -29,19 +31,48 @@ func NewRateLimiter(perSecondLimit int64, stopCh <-chan struct{}) *RateLimiter {
 	}
 }
 
-// Register blocks until n bytes can be sent under the rate limit.
-func (rl *RateLimiter) Register(n int) {
-	if rl == nil || rl.perSecondLimit <= 0 {
-		return
+var errRateLimiterStopped = errors.New("rate limiter stopped")
+
+// Register blocks until n bytes can be sent under the rate limit or ctx is cancelled.
+func (rl *RateLimiter) Register(ctx context.Context, n int64) error {
+	if rl == nil || rl.perSecondLimit <= 0 || n <= 0 {
+		return nil
 	}
 
+	for n > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		chunk := n
+		if chunk > rl.perSecondLimit {
+			chunk = rl.perSecondLimit
+		}
+
+		if err := rl.registerChunk(ctx, chunk); err != nil {
+			if errors.Is(err, errRateLimiterStopped) {
+				return nil
+			}
+			return err
+		}
+		n -= chunk
+	}
+
+	return nil
+}
+
+func (rl *RateLimiter) registerChunk(ctx context.Context, n int64) error {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	// Block until we have enough budget to cover n bytes
-	for rl.budget < int64(n) {
+	for rl.budget < n {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		// If deadline has passed, refill budget
-		if time.Now().After(rl.deadline) {
+		if !time.Now().Before(rl.deadline) {
 			rl.budget += rl.perSecondLimit
 			rl.deadline = time.Now().Add(time.Second)
 		}
@@ -52,9 +83,9 @@ func (rl *RateLimiter) Register(n int) {
 		}
 
 		// If still not enough, wait for next refill
-		if rl.budget < int64(n) {
+		if rl.budget < n {
 			// Calculate how much time is needed to get enough budget
-			needed := int64(n) - rl.budget
+			needed := n - rl.budget
 			// If perSecondLimit is 0, this would be a division by zero.
 			// However, the initial check `rl.perSecondLimit <= 0` handles this,
 			// so we can assume perSecondLimit > 0 here.
@@ -71,17 +102,22 @@ func (rl *RateLimiter) Register(n int) {
 			case <-timer.C:
 				// Timer fired, re-acquire lock and loop to re-evaluate budget
 				putTimer(timer)
+			case <-ctx.Done():
+				putTimer(timer)
+				rl.mu.Lock()
+				return ctx.Err()
 			case <-rl.stopCh:
 				putTimer(timer)
 				rl.mu.Lock()
-				return // Don't consume budget if stopped
+				return errRateLimiterStopped // Don't consume budget if stopped
 			}
 			rl.mu.Lock()
 		}
 	}
 
 	// Consume n bytes from budget
-	rl.budget -= int64(n)
+	rl.budget -= n
+	return nil
 }
 
 // Enabled returns true if the rate limiter is active.

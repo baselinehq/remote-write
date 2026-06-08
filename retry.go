@@ -14,10 +14,13 @@ import (
 )
 
 // isRetryableStatusCode returns true if the HTTP status code is retryable.
-// We retry on 429 (Too Many Requests) and 5xx (Server Errors).
-// We do NOT retry on other 4xx errors (client errors).
+// We retry on 429 (Too Many Requests) and 5xx (Server Errors). Codes outside
+// the standard HTTP range (>= 600) are not retried.
 func isRetryableStatusCode(code int) bool {
-	return code == http.StatusTooManyRequests || code >= 500
+	if code == http.StatusTooManyRequests {
+		return true
+	}
+	return code >= 500 && code < 600
 }
 
 // isRetryableError checks if the error is worth retrying.
@@ -88,21 +91,24 @@ func addJitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(jitter)))
 }
 
-// getRetryDuration calculates the next retry duration.
-// retryAfter from the Retry-After header takes precedence.
-// Otherwise, we use exponential backoff (double the previous duration).
-func getRetryDuration(retryAfter, currentDuration, maxDuration time.Duration) time.Duration {
-	// Retry-After header has highest priority
+// nextRetryWait returns the duration to sleep before the next retry attempt.
+// retryAfter from the Retry-After header takes precedence; otherwise the
+// caller-provided currentDuration is jittered. Use advanceRetryWait to
+// compute the next backoff duration for the iteration that follows.
+func nextRetryWait(retryAfter, currentDuration time.Duration) time.Duration {
 	if retryAfter > 0 {
 		return addJitter(retryAfter)
 	}
+	return addJitter(currentDuration)
+}
 
-	// Exponential backoff
-	nextDuration := currentDuration * 2
-	if nextDuration > maxDuration {
-		nextDuration = maxDuration
+// advanceRetryWait doubles current up to max (no jitter).
+func advanceRetryWait(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		next = max
 	}
-	return addJitter(nextDuration)
+	return next
 }
 
 // parseRetryAfterHeader parses the Retry-After header value.

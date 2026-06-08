@@ -21,7 +21,8 @@ type PushTimeSeriesRequest struct {
 	// MaxSeriesPerBatch is the maximum number of series per batch. Default: 10000.
 	MaxSeriesPerBatch int
 
-	// ExtraHeaders are additional headers to forward.
+	// ExtraHeaders are additional headers to forward. It must not contain
+	// protocol headers or headers managed by client configuration.
 	ExtraHeaders http.Header
 }
 

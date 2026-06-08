@@ -33,13 +33,17 @@ type PushRequest struct {
 	Now func() time.Time
 
 	// MaxBatchBytes is the target uncompressed batch size. Default: 3MB.
-	// This is soft limit; a single large metric family may exceed it.
+	// This is a soft target; a single metric family may push the batch over.
 	MaxBatchBytes int
 
-	// MaxSeriesPerBatch is the maximum number of series per batch. Default: 10000.
+	// MaxSeriesPerBatch is a soft target for the number of series per batch.
+	// Default: 10000. A batch may exceed this when the last appended metric
+	// family pushes the count past the target — the series produced by a
+	// single metric family are never split across batches.
 	MaxSeriesPerBatch int
 
-	// ExtraHeaders are additional headers to forward.
+	// ExtraHeaders are additional headers to forward. It must not contain
+	// protocol headers or headers managed by client configuration.
 	ExtraHeaders http.Header
 }
 
@@ -48,15 +52,9 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 		return fmt.Errorf("gatherer is required")
 	}
 
-	// Validate relabel configs
-	if len(pr.WriteRelabelConfigs) > 0 {
-		for i := range pr.WriteRelabelConfigs {
-			// Set the validation scheme for proper label name validation
-			pr.WriteRelabelConfigs[i].NameValidationScheme = model.UTF8Validation
-			if err := pr.WriteRelabelConfigs[i].Validate(model.UTF8Validation); err != nil {
-				return fmt.Errorf("invalid write_relabel_configs: %w", err)
-			}
-		}
+	relabelCfgs, err := prepareRelabelConfigs(pr.WriteRelabelConfigs)
+	if err != nil {
+		return err
 	}
 
 	mfs, err := pr.Gatherer.Gather()
@@ -140,6 +138,10 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 
 	// Process metric families and batch
 	estimatedBytes := 0
+	var sb labels.ScratchBuilder
+	if relabelCfgs != nil {
+		sb = labels.NewScratchBuilder(0)
+	}
 	for _, mf := range mfs {
 		// Check for context cancellation between batches
 		select {
@@ -153,14 +155,8 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 		convertMetricFamily(mf, tsBuf, extLabels, nowMs, &pooledLabels, &pooledSamples)
 
 		// Apply write_relabel_configs to filter/modify series
-		if len(pr.WriteRelabelConfigs) > 0 {
+		if relabelCfgs != nil {
 			writeIdx := startIdx
-			sb := labels.NewScratchBuilder(0)
-			cfgPtrs := make([]*relabel.Config, len(pr.WriteRelabelConfigs))
-			for i := range pr.WriteRelabelConfigs {
-				cfgPtrs[i] = &pr.WriteRelabelConfigs[i]
-			}
-
 			for i := startIdx; i < len(*tsBuf); i++ {
 				ts := &(*tsBuf)[i]
 
@@ -173,7 +169,7 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 				promLabels := sb.Labels()
 
 				// Apply relabel configs
-				relabeledLabels, keep := relabel.Process(promLabels, cfgPtrs...)
+				relabeledLabels, keep := relabel.Process(promLabels, relabelCfgs...)
 				if !keep {
 					continue // drop this series
 				}
@@ -213,4 +209,25 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 // Push gathers metrics, batches them, and sends them to the remote write endpoint.
 func (c *Client) Push(ctx context.Context, pr PushRequest) error {
 	return pushGathered(ctx, pr, c.sendEncoded)
+}
+
+// prepareRelabelConfigs validates the caller's relabel configs against a
+// private copy so Validate's mutation of NameValidationScheme does not leak
+// back, and returns pointers suitable for relabel.Process. Returns nil when
+// there are no configs.
+func prepareRelabelConfigs(in []relabel.Config) ([]*relabel.Config, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	owned := make([]relabel.Config, len(in))
+	ptrs := make([]*relabel.Config, len(in))
+	for i, src := range in {
+		owned[i] = src
+		owned[i].NameValidationScheme = model.UTF8Validation
+		if err := owned[i].Validate(model.UTF8Validation); err != nil {
+			return nil, fmt.Errorf("invalid write_relabel_configs: %w", err)
+		}
+		ptrs[i] = &owned[i]
+	}
+	return ptrs, nil
 }
