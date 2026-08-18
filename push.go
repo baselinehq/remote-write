@@ -139,8 +139,10 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 	// Process metric families and batch
 	estimatedBytes := 0
 	var sb labels.ScratchBuilder
+	var lb *labels.Builder
 	if relabelCfgs != nil {
 		sb = labels.NewScratchBuilder(0)
+		lb = labels.NewBuilder(labels.EmptyLabels())
 	}
 	for _, mf := range mfs {
 		// Check for context cancellation between batches
@@ -169,10 +171,11 @@ func pushGathered(ctx context.Context, pr PushRequest, deliver func(context.Cont
 				promLabels := sb.Labels()
 
 				// Apply relabel configs
-				relabeledLabels, keep := relabel.Process(promLabels, relabelCfgs...)
-				if !keep {
+				lb.Reset(promLabels)
+				if keep := relabel.ProcessBuilder(lb, relabelCfgs...); !keep {
 					continue // drop this series
 				}
+				relabeledLabels := lb.Labels()
 
 				// Convert back to prompb.Label
 				ts.Labels = prompb.FromLabels(relabeledLabels, ts.Labels[:0])
