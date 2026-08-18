@@ -1,0 +1,56 @@
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: go
+            build-mode: autobuild
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git for private modules
+        env:
+          GO_GET_TOKEN: ${{ secrets.GO_GET_TOKEN }}
+        run: |
+          if [ -n "$GO_GET_TOKEN" ]; then
+            git config --global url."https://x-access-token:${GO_GET_TOKEN}@github.com/baselinehq/".insteadOf "https://github.com/baselinehq/"
+            echo "GOPRIVATE=github.com/baselinehq/*" >> "$GITHUB_ENV"
+          fi
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
