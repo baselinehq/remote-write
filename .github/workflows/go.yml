@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions:
+      contents: read
       id-token: write
     outputs:
       runners: ${{ steps.route.outputs.runners }}
