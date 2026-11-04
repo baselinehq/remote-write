@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   route:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 2
     permissions:
       contents: read
