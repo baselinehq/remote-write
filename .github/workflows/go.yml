@@ -15,8 +15,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      runners: ${{ steps.route.outputs.runners }}
+    steps:
+      - id: route
+        uses: baselinehq/costgraph-action/route@v0
+        with:
+          default: ubicloud-standard-2
+          jobs: '{"test":"ubicloud-standard-2"}'
+
   test:
-    runs-on: ubicloud-standard-2
+    needs: [route]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}').test || 'ubicloud-standard-2' }}
     steps:
       - uses: actions/checkout@v4
 
