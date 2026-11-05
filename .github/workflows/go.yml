@@ -38,7 +38,6 @@ jobs:
         uses: baselinehq/costgraph-action/route@v0
         with:
           default: ubicloud-standard-2
-          jobs: '{"test":"ubicloud-standard-2"}'
 
   test:
     needs: [route]
