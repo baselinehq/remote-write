@@ -2,8 +2,18 @@ name: CodeQL
 
 on:
   pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/**'
   push:
     branches: ["main"]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/**'
   schedule:
     - cron: "41 4 * * 1"
   workflow_dispatch:
